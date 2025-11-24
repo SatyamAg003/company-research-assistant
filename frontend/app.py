@@ -9,6 +9,7 @@ import threading
 import queue
 import tempfile
 from io import BytesIO
+import re
 
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
 
@@ -103,6 +104,75 @@ def transcribe_audio():
     except Exception as e:
         return f"Error with microphone: {str(e)}"
 
+def contains_gibberish(text):
+    """Check if text contains obvious gibberish patterns"""
+    text_lower = text.lower()
+    
+    # Common gibberish patterns (keyboard mashing, lorem ipsum, etc.)
+    gibberish_patterns = [
+        'asdf', 'jkl', 'qwerty', 'zxcv', 'lorem', 'ipsum', 'dolor', 'sit', 'amet',
+        'test', 'example', 'sample', 'random', 'foo', 'bar', 'baz'
+    ]
+    
+    # Check for repeating characters (like "aaaa", "jjjj", etc.)
+    if re.search(r'(.)\1{3,}', text_lower):  # 4 or more repeating characters
+        return True
+    
+    # Check for keyboard row patterns (qwerty, asdf, etc.)
+    if any(pattern in text_lower for pattern in gibberish_patterns):
+        return True
+    
+    # Check for unusual character sequences (too many consonants/vowels in a row)
+    words = text_lower.split()
+    for word in words:
+        if len(word) > 3:
+            # Check for consonant-heavy or vowel-heavy sequences
+            consonants = len(re.findall(r'[bcdfghjklmnpqrstvwxyz]', word))
+            vowels = len(re.findall(r'[aeiou]', word))
+            if consonants > vowels * 2 or vowels > consonants * 2:  # Unbalanced ratio
+                return True
+    
+    # Check for meaningless short words that aren't real words
+    common_words = ['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use']
+    if len(text_lower) < 4 and text_lower not in common_words:
+        return True
+    
+    return False
+
+def is_valid_company_name(company_name):
+    """Validate if the extracted company name is likely to be a real company"""
+    company_lower = company_name.lower()
+    
+    # Check for obvious gibberish
+    if contains_gibberish(company_name):
+        return False
+    
+    # Check for meaningless phrases
+    meaningless_phrases = [
+        'from my dreams', 'from my imagination', 'my dreams', 'my imagination',
+        'something about', 'some company', 'any company', 'what were', 'were doing',
+        'cousin works', 'says coffee', 'coffee great'
+    ]
+    
+    if any(phrase in company_lower for phrase in meaningless_phrases):
+        return False
+    
+    # Check if it's too short or too long to be reasonable
+    if len(company_name) < 2 or len(company_name) > 50:
+        return False
+    
+    # Be more lenient with capitalization for single-word company names
+    words = company_name.split()
+    if len(words) == 1:
+        # Single word companies can be any capitalization
+        return True
+    else:
+        # For multi-word, check if most words start with capital letters
+        capitalized_words = sum(1 for word in words if word and word[0].isupper())
+        if capitalized_words < len(words) * 0.3:  # Reduced from 0.5 to 0.3
+            return False
+    
+    return True
 def is_research_request(prompt):
     """Check if the user is requesting new research"""
     research_keywords = [
@@ -138,18 +208,76 @@ def extract_company_name(prompt):
     ]
     
     prompt_lower = prompt.lower()
+    
+    # FIRST: Try to extract company name even from messy input
+    # Look for research patterns followed by company names
+    for keyword in research_keywords:
+        if keyword in prompt_lower:
+            # Find the position after the research keyword
+            keyword_pos = prompt_lower.find(keyword)
+            after_keyword = prompt_lower[keyword_pos + len(keyword):].strip()
+            
+            # Extract the first meaningful word(s) after research keyword
+            words_after = after_keyword.split()
+            potential_company_words = []
+            
+            for word in words_after:
+                if (word not in ['the', 'a', 'an', 'about', 'on', 'for', 'and', 'but', 'anyway'] and
+                    len(word) > 2 and not contains_gibberish(word)):
+                    potential_company_words.append(word)
+                    # Stop if we hit conversational markers
+                    if word in ['my', 'i', 'we', 'you', 'anyway', 'what', 'were']:
+                        break
+            
+            if potential_company_words:
+                company_name = ' '.join(potential_company_words).title()
+                if is_valid_company_name(company_name):
+                    return company_name
+    
+    # SECOND: Check for vague requests that need clarification
+    vague_phrases = [
+        'something about',
+        'some companies',
+        'any company', 
+        'a company',
+        'companies in general',
+        'business in general',
+        'tell me about companies',
+        'research companies'
+    ]
+    
+    # If it's a vague request without any specific company mention, return None
+    if any(phrase in prompt_lower for phrase in vague_phrases):
+        # But only if no company is mentioned
+        company_indicators = ['microsoft', 'apple', 'google', 'amazon', 'tesla', 'netflix', 
+                             'meta', 'facebook', 'ibm', 'intel', 'samsung', 'sony']
+        if not any(company in prompt_lower for company in company_indicators):
+            return None
+    
+    # THIRD: Fallback - extract company using the old method but be more lenient
     words = prompt_lower.split()
     
     # Remove research keywords and common words
     filtered_words = []
     for word in words:
-        if word not in research_keywords and word not in ['the', 'a', 'an', 'about', 'on', 'for']:
+        if (word not in research_keywords and 
+            word not in ['the', 'a', 'an', 'about', 'on', 'for', 'something', 'companies', 'business',
+                        'lorem', 'ipsum', 'from', 'my', 'dreams', 'corporation', 'company',
+                        'cousin', 'works', 'says', 'coffee', 'great', 'anyway', 'what', 'were', 'doing'] and
+            len(word) > 1 and  # Ignore single letters
+            not word.isnumeric() and  # Ignore numbers
+            not contains_gibberish(word)):  # Ignore gibberish
             filtered_words.append(word)
     
     company_name = ' '.join(filtered_words).title()
     
+    # Additional validation
     if len(company_name.strip()) < 2:
-        company_name = prompt.title()
+        return None
+    
+    # Final validation check
+    if not is_valid_company_name(company_name):
+        return None
     
     return company_name.strip()
 
@@ -224,7 +352,23 @@ if prompt:
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         
-        if should_do_research and company_to_research:
+        # Handle vague research requests
+        if should_do_research and not company_to_research:
+            clarification_response = """
+I'd be happy to help you research companies! To get started, I need to know which specific company you're interested in.
+
+**Examples:**
+- "Research Microsoft"
+- "Tell me about Tesla"
+- "Analyze Apple's business strategy"
+- "Generate account plan for Amazon"
+
+Which specific company would you like me to research?
+"""
+            message_placeholder.markdown(clarification_response)
+            st.session_state.messages.append({"role": "assistant", "content": clarification_response})
+            
+        elif should_do_research and company_to_research:
             # Start research
             st.session_state.research_in_progress = True
             st.session_state.current_company = company_to_research
